@@ -1,3 +1,4 @@
+import 'server-only';
 import { z } from 'zod';
 import { db, transaction, lockUsers, databaseNow, audit } from './db';
 import { Actor, requireRole } from './permissions';

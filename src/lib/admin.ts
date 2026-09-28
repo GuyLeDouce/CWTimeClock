@@ -1,3 +1,4 @@
+import 'server-only';
 import { z } from 'zod';
 import { Role } from '@prisma/client';
 import { db, transaction, audit, Tx, lockUsers } from './db';
@@ -5,6 +6,7 @@ import { Actor, has, requireRole } from './permissions';
 import { ensure } from './errors';
 import { randomToken } from './crypto';
 import { validZone } from './time';
+import { emailSchema } from './validation';
 const id = z.string().min(1);
 const ids = z.array(id).max(1000).default([]);
 export const roles = z
@@ -17,7 +19,7 @@ export const roles = z
 export const userFields = z.object({
   firstName: z.string().trim().min(1).max(80),
   lastName: z.string().trim().min(1).max(80),
-  email: z.email().transform((v) => v.toLowerCase()),
+  email: emailSchema,
   active: z.boolean().default(true),
   earliestStart: z
     .string()
@@ -79,8 +81,7 @@ export const adminSchema = z.discriminatedUnion('entity', [
     entity: z.literal('settings'),
     data: z.object({
       timezone: z.string().trim().refine(validZone),
-      reportRecipient: z.union([z.email(), z.literal('')]),
-      weekStartsOn: z.literal(1).default(1),
+      reportRecipient: z.union([emailSchema, z.literal('')]),
     }),
   }),
 ]);

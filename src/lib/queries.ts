@@ -1,5 +1,6 @@
+import 'server-only';
 import { DateTime } from 'luxon';
-import { db } from './db';
+import { db, databaseNow } from './db';
 import { Actor, has, modes, requireManagement, segmentScope } from './permissions';
 import { companySettings, segmentInclude } from './clock';
 import {
@@ -49,12 +50,14 @@ export async function state(actor: Actor, token?: string) {
     qr,
     timezone: normalizeZone(actor.timezone, settings.timezone),
     companyTimezone: settings.timezone,
-    serverNow: new Date().toISOString(),
+    serverNow: (await databaseNow(db)).toISOString(),
   };
 }
 export async function myHours(actor: Actor) {
-  const settings = await companySettings(),
-    now = new Date();
+  const settings = await companySettings();
+  // Live totals clip open segments at "now": use the database clock, the same
+  // source as punch timestamps, so app-server clock drift cannot inflate them.
+  const now = await databaseNow(db);
   const zone = normalizeZone(actor.timezone, settings.timezone);
   ensure(
     validZone(zone) && validZone(settings.timezone),
@@ -62,7 +65,8 @@ export async function myHours(actor: Actor) {
   );
   const today = DateTime.fromJSDate(now, { zone }).startOf('day').toJSDate(),
     tomorrow = DateTime.fromJSDate(today, { zone }).plus({ days: 1 }).toJSDate();
-  const week = previousWeek(now, settings.timezone);
+  // The personal week view follows the employee's own timezone, matching "today" above.
+  const week = previousWeek(now, zone);
   const records = await db.timeSegment.findMany({
     where: {
       userId: actor.id,

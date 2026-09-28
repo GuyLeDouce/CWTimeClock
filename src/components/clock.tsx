@@ -1,5 +1,5 @@
 'use client';
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 import {
   ArrowRight,
   ArrowRightLeft,
@@ -11,7 +11,8 @@ import {
   QrCode,
   Truck,
 } from 'lucide-react';
-import { api, time, duration, pretty, dayHeading } from '@/lib/client';
+import { time, duration, pretty, dayHeading } from '@/lib/client';
+import { submitPunch, queueCount, type PunchAction } from '@/lib/offline';
 import { validZone } from '@/lib/time';
 import type { State } from '@/lib/client-types';
 import { ErrorBox, Success, Badge } from './ui';
@@ -42,7 +43,13 @@ export function ClockScreen({
     [error, setError] = useState(''),
     [success, setSuccess] = useState(''),
     [offline, setOffline] = useState(false);
-  const receipt = useRef<{ body: string; key: string } | null>(null);
+  const [queued, setQueued] = useState(0);
+  useEffect(() => {
+    const syncQueue = () => setQueued(queueCount());
+    syncQueue();
+    window.addEventListener('cw:queue-changed', syncQueue);
+    return () => window.removeEventListener('cw:queue-changed', syncQueue);
+  }, []);
   const [, tick] = useState(0);
   useEffect(() => {
     const timer = setInterval(() => tick((n) => n + 1), 30000);
@@ -73,34 +80,36 @@ export function ClockScreen({
     ? arrival || effectiveMode === 'SHOP' || (effectiveMode === 'SITE' && !travelSwitch)
     : mode === 'SHOP';
   const timezoneValid = validZone(data.timezone) && validZone(data.companyTimezone);
+  // Offline punches are queued and replayed, so the buttons stay enabled.
+  const punchLabel = (live: string) =>
+    busy ? 'Recording…' : offline ? `Queue ${live.toLowerCase()}` : live;
   const canSubmit =
     timezoneValid &&
     !!job &&
     (!needsTask || !!task) &&
     !!token &&
-    !offline &&
     !(switching && current?.type === 'SITE' && data.qr?.type === 'SHOP' && !switchingMode);
-  async function submit(action: 'CLOCK_IN' | 'SWITCH' | 'ARRIVED' | 'CLOCK_OUT') {
+  async function submit(action: PunchAction) {
     setBusy(true);
     setError('');
     setSuccess('');
-    const base = {
-      qrToken: token,
-      action,
-      expectedSegmentId: current?.id ?? null,
-      ...(mode ? { mode } : {}),
-      jobsiteId: job,
-      taskId: needsTask ? task : null,
-      notes,
-    };
-    const body = JSON.stringify(base);
-    if (receipt.current?.body !== body) receipt.current = { body, key: crypto.randomUUID() };
     try {
-      const result = await api<{ message: string }>('punch', { ...base, key: receipt.current.key });
-      receipt.current = null;
-      setSuccess(result.message);
-      setNotes('');
-      setSwitching(false);
+      const result = await submitPunch({
+        qrToken: token!,
+        action,
+        expectedSegmentId: current?.id ?? null,
+        ...(mode ? { mode } : {}),
+        jobsiteId: job,
+        taskId: needsTask ? task : null,
+        notes,
+      });
+      if (result.status === 'queued') {
+        setSuccess(result.message);
+      } else {
+        setSuccess(result.message);
+        setNotes('');
+        setSwitching(false);
+      }
       await refresh();
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Please try again.');
@@ -276,7 +285,7 @@ export function ClockScreen({
                   disabled={busy || !canSubmit}
                   onClick={() => submit('CLOCK_IN')}
                 >
-                  {busy ? 'Recording…' : 'CLOCK IN'}
+                  {punchLabel('CLOCK IN')}
                   <ArrowRight size={22} />
                 </button>
               </>
@@ -297,14 +306,10 @@ export function ClockScreen({
             disabled={busy || !canSubmit}
             onClick={() => submit('ARRIVED')}
           >
-            {busy ? 'Recording…' : 'ARRIVED'}
+            {punchLabel('ARRIVED')}
             <CheckCircle2 size={22} />
           </button>
-          <button
-            className="text-button"
-            disabled={busy || offline}
-            onClick={() => submit('CLOCK_OUT')}
-          >
+          <button className="text-button" disabled={busy} onClick={() => submit('CLOCK_OUT')}>
             Clock out instead
           </button>
         </section>
@@ -334,7 +339,7 @@ export function ClockScreen({
             disabled={busy || !canSubmit}
             onClick={() => submit('SWITCH')}
           >
-            {busy ? 'Recording…' : 'SWITCH'}
+            {punchLabel('SWITCH')}
             <ArrowRightLeft size={22} />
           </button>
           <button className="text-button" onClick={() => setSwitching(false)}>
@@ -349,7 +354,7 @@ export function ClockScreen({
               data.modes.some((m) => m !== 'SITE')) && (
               <button
                 className="primary punch"
-                disabled={busy || offline}
+                disabled={busy}
                 onClick={() => setSwitching(true)}
               >
                 SWITCH
@@ -361,16 +366,24 @@ export function ClockScreen({
           )}
           <button
             className="secondary punch"
-            disabled={busy || offline}
+            disabled={busy}
             onClick={() => submit('CLOCK_OUT')}
           >
-            {busy ? 'Recording…' : 'CLOCK OUT'}
+            {punchLabel('CLOCK OUT')}
             <LogOut size={23} />
           </button>
         </section>
       )}
+      {queued > 0 && (
+        <p className="notice" role="status">
+          {queued} queued punch{queued === 1 ? '' : 'es'} will send automatically when you are back
+          online.
+        </p>
+      )}
       <p className="clock-foot">
-        Time is recorded only after confirmation.
+        {offline
+          ? 'Offline: punches are queued with the tap time and sent when you reconnect.'
+          : 'Time is recorded only after confirmation.'}
         <br />
         Employee selections and QR scans. No GPS.
       </p>

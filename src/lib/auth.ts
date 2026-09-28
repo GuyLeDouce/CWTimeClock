@@ -1,3 +1,4 @@
+import 'server-only';
 import { cookies } from 'next/headers';
 import { db, transaction, databaseNow, audit } from './db';
 import { digest, privateKey, randomToken, hashPassword, verifyPassword } from './crypto';
@@ -78,6 +79,11 @@ export async function sendReset(email: string) {
     } catch {
       console.error('Password reset email delivery failed.');
     }
+  } else {
+    // Do comparable work for unknown addresses so response timing does not
+    // reveal whether an account exists. Not a perfect mask for SMTP latency,
+    // but it removes the trivial fast-vs-slow signal.
+    await hashPassword(randomToken());
   }
   return { message: 'If this email has an active account, a password link has been sent.' };
 }

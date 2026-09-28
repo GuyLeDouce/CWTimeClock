@@ -1,3 +1,4 @@
+import 'server-only';
 import { Prisma, Role, User } from '@prisma/client';
 import { AppError, ensure } from './errors';
 import { db, Tx } from './db';

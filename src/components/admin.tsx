@@ -449,7 +449,6 @@ function Settings({ data, refresh }: { data: AdminData; refresh: () => Promise<v
             data: {
               timezone: f.get('timezone'),
               reportRecipient: f.get('reportRecipient'),
-              weekStartsOn: 1,
             },
           });
           setMessage('Settings saved.');

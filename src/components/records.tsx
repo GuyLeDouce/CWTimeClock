@@ -6,6 +6,18 @@ import { Check, Download, Filter, Pencil, Send } from 'lucide-react';
 import { api, useApi, time, date, duration } from '@/lib/client';
 import type { Options, RecordRow } from '@/lib/client-types';
 import { Loading, ErrorBox, Success, Badge, Modal, Empty, ActionButton } from './ui';
+// Map.groupBy is ES2024 and throws at runtime on Safari <18 / iOS 17, which this
+// phone-first PWA must support. This helper provides the same grouping on ES2022.
+function groupBy<T, K>(items: T[], key: (item: T) => K): Map<K, T[]> {
+  const groups = new Map<K, T[]>();
+  for (const item of items) {
+    const k = key(item);
+    const list = groups.get(k);
+    if (list) list.push(item);
+    else groups.set(k, [item]);
+  }
+  return groups;
+}
 export function RecordsScreen({ kind, owner }: { kind: 'verify' | 'send'; owner: boolean }) {
   const { data: options, error } = useApi<Options>('options');
   return (
@@ -128,7 +140,7 @@ function RecordWorkspace({
   const grouped =
     kind === 'send'
       ? new Map([['Accounting records', records]])
-      : Map.groupBy(records, (r) => `${r.user.firstName} ${r.user.lastName} · ${r.userId}`);
+      : groupBy(records, (r) => `${r.user.firstName} ${r.user.lastName} · ${r.userId}`);
   return (
     <>
       <section className="card filter-card">
@@ -329,7 +341,7 @@ function RecordWorkspace({
             {[
               ...(kind === 'send'
                 ? new Map([['report', employeeRows]])
-                : Map.groupBy(employeeRows, (r) =>
+                : groupBy(employeeRows, (r) =>
                     DateTime.fromISO(r.effectiveStart).setZone(zone).toISODate(),
                   )),
             ].map(([day, dayRows]) => (

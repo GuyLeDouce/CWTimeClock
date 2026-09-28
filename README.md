@@ -14,7 +14,7 @@ A mobile-first, installable timeclock for **Cedar Winds Design~Build**, with sho
 - Controller Locate/Info/Send after clock-in. Owner management dashboard and separate site visits.
 - Employee/project/task/code/truck configuration, permission assignments, CSV templates/preview/all-or-nothing import, and audit history.
 - Filtered reporting, approved-only final accounting batches, explicit audited Owner override, immutable CSV snapshots, and SMTP report emails.
-- PWA manifest, icons, Apple metadata, offline warning, and static-only service-worker cache. Punches are never queued offline.
+- PWA manifest, icons, Apple metadata, offline warning, and static-only service-worker cache. Punches tapped offline are queued on the device and replayed on reconnect.
 - SQL migration, safe seed script, Docker/Railway configuration, and unit/database/browser tests with GitHub Actions.
 
 See [architecture and operating rules](docs/architecture.md) for permissions, payroll boundaries, and implementation decisions. The original supplied brief is in [original-requirements.md](docs/original-requirements.md).
@@ -79,6 +79,10 @@ Open [localhost:3000](http://localhost:3000) and sign in with your configured ow
 
 The Dockerfile sets `NODE_ENV=production`, listens on Railway’s injected `PORT`, and runs as the non-root `node` user. Do not set the start command to `npm run dev`. The database is not needed during the build, but is required for migration, seed, and runtime.
 
+### Scheduled retention cleanup
+
+Ephemeral rows (expired sessions, used or expired action tokens, stale rate-limit buckets, and punch receipts older than 30 days) are removed by `npm run retention`. Time records, export batches, and the audit log are never deleted. In Railway, add a **Cron Job** on the app service running `npm run retention` once a day (for example `0 4 * * *`). The job needs the same `DATABASE_URL` as the app service.
+
 Railway reference: [pre-deploy commands](https://docs.railway.com/deployments/pre-deploy-command) and [PostgreSQL](https://docs.railway.com/databases/postgresql).
 
 ## Trouble signing in after deployment
@@ -133,7 +137,7 @@ The app’s header includes these instructions. Employees normally remain signed
 
 A phone camera’s QR result may open Safari/Chrome rather than the installed PWA, and browser/PWA cookie storage can differ by platform. If prompted, sign in once in that browser too. Both use the same live records. The application cannot force iOS to route every camera scan into a standalone PWA.
 
-No internet: a cached offline page explains **“Internet connection required to record time.”** Nothing is queued. If a connection drops during a punch, refresh to check whether the server confirmed it before retrying.
+No internet: punches are queued on the phone with the tap time and the punch’s idempotency key, then sent automatically when the connection returns. Queued punches older than 24 hours are rejected and need a manager correction. If a connection drops during a punch, check the queue indicator: a queued punch will send itself; a confirmed punch will not duplicate thanks to the idempotency key.
 
 ## Brand assets
 

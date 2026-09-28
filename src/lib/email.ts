@@ -1,3 +1,4 @@
+import 'server-only';
 import nodemailer from 'nodemailer';
 import { AppError } from './errors';
 export type Mail = {

@@ -1,3 +1,4 @@
+import 'server-only';
 import { z } from 'zod';
 import { Prisma, Role, TimeSegment } from '@prisma/client';
 import { db, transaction, databaseNow, lockUsers, audit, json, Tx } from './db';
@@ -23,6 +24,9 @@ export const punchSchema = z
     jobsiteId: z.string().optional(),
     taskId: z.string().nullish(),
     notes: z.string().max(2000).default(''),
+    // Set by the client only for punches queued while offline: the moment the
+    // employee tapped, so hours reflect the real shift once replayed.
+    clientAt: z.iso.datetime({ offset: true }).optional(),
   })
   .strict();
 export type Punch = z.infer<typeof punchSchema>;
@@ -43,7 +47,6 @@ export async function companySettings(tx: Tx = db) {
     id: 'company',
     timezone: process.env.APP_TIMEZONE ?? DEFAULT_ZONE,
     reportRecipient: '',
-    weekStartsOn: 1,
   };
   return { ...settings, timezone: normalizeZone(settings.timezone) };
 }
@@ -130,7 +133,23 @@ export async function punch(user: Actor, input: Punch) {
       'This QR code has been revoked or is unavailable.',
       404,
     );
-    const now = await databaseNow(tx);
+    const serverNow = await databaseNow(tx);
+    // Offline punches carry the client tap time. Trust it within a tight
+    // window (small future skew, 24h backdate limit); anything older needs a
+    // manager correction so payroll stays auditable.
+    let now = serverNow;
+    let offlinePunch: string | null = null;
+    if (input.clientAt) {
+      const clientAt = new Date(input.clientAt);
+      ensure(Number.isFinite(+clientAt), 'Invalid punch time.');
+      ensure(clientAt <= new Date(+serverNow + 5 * 60000), 'Punch time cannot be in the future.');
+      ensure(
+        clientAt >= new Date(+serverNow - 24 * 3600000),
+        'Offline punches older than 24 hours need a manager correction.',
+      );
+      now = clientAt;
+      offlinePunch = input.clientAt;
+    }
     const settings = await companySettings(tx);
     const zone = normalizeZone(actor.timezone, settings.timezone);
     ensure(
@@ -193,6 +212,7 @@ export async function punch(user: Actor, input: Punch) {
       await audit(tx, actor.id, 'CLOCK_IN', 'TimeSegment', segment.id, null, {
         ...segment,
         qrId: qr.id,
+        offlinePunch,
       });
       if (type === 'TRAVEL')
         message =
@@ -204,13 +224,16 @@ export async function punch(user: Actor, input: Punch) {
         'Use the shop QR for shop and office work.',
       );
       if (input.action === 'CLOCK_OUT') {
-        await closeSegment(tx, current, now, settings.timezone);
+        // Midnight splits use the workday's stored timezone so hours land on the
+        // same payroll day the shift started on, even for travelling employees.
+        await closeSegment(tx, current, now, current.workDay.timezone);
         await tx.workDay.update({ where: { id: current.workDayId }, data: { endedAt: now } });
         await audit(tx, actor.id, 'CLOCK_OUT', 'WorkDay', current.workDayId, null, {
           at: now,
           qrId: qr.id,
           truckId: qr.truckId ?? current.truckId,
           jobsiteId: current.jobsiteId,
+          offlinePunch,
         });
         message = "You're clocked out. Enjoy the rest of your day!";
       } else {
@@ -236,7 +259,7 @@ export async function punch(user: Actor, input: Punch) {
           taskId,
           ['SHOP', 'SITE'].includes(type),
         );
-        const boundary = await closeSegment(tx, current, now, settings.timezone);
+        const boundary = await closeSegment(tx, current, now, current.workDay.timezone);
         const segment = await tx.timeSegment.create({
           data: {
             userId: actor.id,
@@ -257,6 +280,7 @@ export async function punch(user: Actor, input: Punch) {
         await audit(tx, actor.id, input.action, 'TimeSegment', segment.id, null, {
           ...segment,
           qrId: qr.id,
+          offlinePunch,
         });
         if (qr.truckId)
           await tx.truck.update({

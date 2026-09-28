@@ -1,9 +1,10 @@
+import 'server-only';
 import { z } from 'zod';
 import { DateTime } from 'luxon';
 import { TimeSegment } from '@prisma/client';
 import { transaction, lockUsers, audit, databaseNow, Tx } from './db';
 import { Actor, canApprove, allowedSelection } from './permissions';
-import { ensure } from './errors';
+import { AppError, ensure } from './errors';
 import { companySettings } from './clock';
 import { dateKey, previousWeek } from './time';
 export const editSchema = z
@@ -102,8 +103,10 @@ export async function editRecord(actor: Actor, input: z.infer<typeof editSchema>
       );
     const start = new Date(input.effectiveStart),
       end = new Date(input.end);
-    const settings = await companySettings(tx);
-    const nextMidnight = DateTime.fromJSDate(start, { zone: settings.timezone })
+    // Corrections stay within the workday's own calendar day, matching the
+    // timezone the shift was recorded in rather than the company timezone.
+    const dayZone = existing.workDay.timezone;
+    const nextMidnight = DateTime.fromJSDate(start, { zone: dayZone })
       .startOf('day')
       .plus({ days: 1 })
       .toJSDate();
@@ -126,8 +129,8 @@ export async function editRecord(actor: Actor, input: z.infer<typeof editSchema>
       const day = await tx.workDay.create({
         data: {
           userId: input.userId,
-          date: dateKey(start, settings.timezone),
-          timezone: settings.timezone,
+          date: dateKey(start, dayZone),
+          timezone: dayZone,
           originalStart: existing.originalStart,
           paidStart: start,
           endedAt: end,
@@ -139,6 +142,12 @@ export async function editRecord(actor: Actor, input: z.infer<typeof editSchema>
       where: { id: input.id },
       data: { ...changes, workDayId, status: 'PENDING_PM_APPROVAL', version: { increment: 1 } },
     });
+    if (workDayId !== existing.workDayId) {
+      // Reassignment moved the last segment off the old workday: remove the
+      // now-empty day so it does not linger as an orphan.
+      const remaining = await tx.timeSegment.count({ where: { workDayId: existing.workDayId } });
+      if (remaining === 0) await tx.workDay.delete({ where: { id: existing.workDayId } });
+    }
     await audit(
       tx,
       actor.id,
@@ -160,17 +169,38 @@ export const approvalSchema = z
       .max(1000),
   })
   .strict();
+// Approving hundreds of records in one serializable transaction exceeds the 20s
+// statement timeout (each record costs several round trips). Process in small
+// chunks; the per-record version checks make chunking safe under concurrency.
+const APPROVAL_CHUNK = 25;
 export async function approveRecords(actor: Actor, input: z.infer<typeof approvalSchema>) {
   ensure(
     new Set(input.records.map((r) => r.id)).size === input.records.length,
     'Duplicate records.',
   );
+  let count = 0;
+  for (let i = 0; i < input.records.length; i += APPROVAL_CHUNK) {
+    try {
+      count += await approveChunk(actor, input.records.slice(i, i + APPROVAL_CHUNK));
+    } catch (error) {
+      // Earlier chunks are already committed; report progress so the user can
+      // refresh and retry the remainder instead of re-approving blindly.
+      const detail = error instanceof Error ? error.message : 'Approval failed.';
+      throw new AppError(409, `${detail} ${count} of ${input.records.length} records were approved.`);
+    }
+  }
+  return { ok: true, count };
+}
+async function approveChunk(
+  actor: Actor,
+  chunk: { id: string; version: number }[],
+): Promise<number> {
   return transaction(async (tx) => {
     const records = await tx.timeSegment.findMany({
-      where: { id: { in: input.records.map((r) => r.id) } },
+      where: { id: { in: chunk.map((r) => r.id) } },
       include: { workDay: true },
     });
-    ensure(records.length === input.records.length, 'Some records no longer exist.');
+    ensure(records.length === chunk.length, 'Some records no longer exist.');
     await lockUsers(
       tx,
       records.map((r) => r.userId),
@@ -181,7 +211,7 @@ export async function approveRecords(actor: Actor, input: z.infer<typeof approva
     for (const record of records) {
       await canApprove(tx, actor, record.userId, record.jobsiteId);
       ensure(
-        record.version === input.records.find((r) => r.id === record.id)?.version,
+        record.version === chunk.find((r) => r.id === record.id)?.version,
         'A record changed. Refresh before approving.',
         409,
       );
@@ -203,7 +233,7 @@ export async function approveRecords(actor: Actor, input: z.infer<typeof approva
       });
       await audit(tx, actor.id, 'PM_APPROVED', 'TimeSegment', record.id, record, approved);
     }
-    return { ok: true, count: records.length };
+    return records.length;
   });
 }
 
@@ -232,14 +262,14 @@ export async function closeForgottenDay(actor: Actor, input: z.infer<typeof clos
     );
     const now = await databaseNow(tx),
       end = new Date(input.end),
-      settings = await companySettings(tx);
+      dayZone = current.workDay.timezone;
     ensure(
       end >= current.originalStart && end <= now,
       'Choose an end after the scan and no later than the current time.',
     );
     const effectiveEnd = new Date(Math.max(+end, +current.effectiveStart));
     const { splitAtMidnights } = await import('./time');
-    const parts = splitAtMidnights(current.effectiveStart, effectiveEnd, settings.timezone);
+    const parts = splitAtMidnights(current.effectiveStart, effectiveEnd, dayZone);
     const updated = await tx.timeSegment.update({
       where: { id: current.id },
       data: { end: parts[0].end, status: 'PENDING_PM_APPROVAL', version: { increment: 1 } },

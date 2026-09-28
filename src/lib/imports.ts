@@ -1,3 +1,4 @@
+import 'server-only';
 import { parse } from 'csv-parse/sync';
 import { z } from 'zod';
 import { db, transaction, audit } from './db';
@@ -53,32 +54,66 @@ export async function importCsv(actor: Actor, input: z.infer<typeof importSchema
   const errors: { row: number; message: string }[] = [],
     prepared: AdminInput[] = [],
     seen = new Set<string>();
+  // First pass: extract and validate keys per row, keeping row numbers for errors.
+  const keyed: { index: number; row: (typeof rows)[number]; key: string }[] = [];
   for (const [index, row] of rows.entries()) {
     try {
-      const entity = input.entity;
       const key = (
-        entity === 'employees'
+        input.entity === 'employees'
           ? row.email?.toLowerCase()
-          : entity === 'jobsites'
+          : input.entity === 'jobsites'
             ? row.number
-            : entity === 'codes'
+            : input.entity === 'codes'
               ? row.code
               : row.name
       )?.trim();
       ensure(key, 'Missing unique key.');
       ensure(!seen.has(key), 'Duplicate key within this file.');
       seen.add(key);
-      const existing =
-        entity === 'employees'
-          ? await db.user.findUnique({ where: { email: key } })
-          : entity === 'jobsites'
-            ? await db.jobsite.findUnique({ where: { number: key } })
-            : entity === 'codes'
-              ? await db.accountingCode.findUnique({ where: { code: key } })
-              : await db.task.findUnique({ where: { name: key } });
+      keyed.push({ index, row, key });
+    } catch (error) {
+      errors.push({
+        row: index + 2,
+        message:
+          error instanceof z.ZodError
+            ? error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; ')
+            : error instanceof Error
+              ? error.message
+              : 'Invalid row.',
+      });
+    }
+  }
+  // Batch the duplicate-existence checks: one query per entity instead of one per row.
+  const taken = new Set<string>();
+  if (keyed.length > 0) {
+    const keys = [...new Set(keyed.map((k) => k.key))];
+    const found: string[] =
+      input.entity === 'employees'
+        ? (await db.user.findMany({ where: { email: { in: keys } }, select: { email: true } })).map(
+            (u) => u.email,
+          )
+        : input.entity === 'jobsites'
+          ? (
+              await db.jobsite.findMany({ where: { number: { in: keys } }, select: { number: true } })
+            ).map((j) => j.number)
+          : input.entity === 'codes'
+            ? (
+                await db.accountingCode.findMany({
+                  where: { code: { in: keys } },
+                  select: { code: true },
+                })
+              ).map((c) => c.code)
+            : (
+                await db.task.findMany({ where: { name: { in: keys } }, select: { name: true } })
+              ).map((t) => t.name);
+    for (const k of found) taken.add(k);
+  }
+  for (const { index, row, key } of keyed) {
+    try {
+      const entity = input.entity;
       // Existing records are rejected explicitly: no accidental replacement of permission assignments.
       ensure(
-        !existing,
+        !taken.has(key),
         'Already exists. Edit the existing record in Admin; this import creates new records only.',
       );
       const data =

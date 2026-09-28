@@ -1,7 +1,8 @@
+import 'server-only';
 import { Prisma } from '@prisma/client';
 import { DateTime } from 'luxon';
 import { z } from 'zod';
-import { db, transaction, audit, lockUsers } from './db';
+import { db, transaction, audit, lockUsers, databaseNow } from './db';
 import { Actor, has, requireManagement, segmentScope } from './permissions';
 import { companySettings, segmentInclude } from './clock';
 import { dateRange, hours, durationMs, previousWeek } from './time';
@@ -25,7 +26,7 @@ export async function recordFilter(
   filters: Filters,
 ): Promise<Prisma.TimeSegmentWhereInput> {
   const settings = await companySettings();
-  const defaults = previousWeek(new Date(), settings.timezone);
+  const defaults = previousWeek(await databaseNow(db), settings.timezone);
   ensure(!!filters.from === !!filters.to, 'Select both a start and an end date.');
   const range =
     filters.from && filters.to ? dateRange(filters.from, filters.to, settings.timezone) : defaults;
@@ -71,28 +72,31 @@ export const exportSchema = z
     overrideReason: z.string().max(1000).optional(),
   })
   .strict();
-export async function finalizeExport(actor: Actor, input: z.infer<typeof exportSchema>) {
-  await requireManagement(actor, 'send');
-  ensure(
-    new Set(input.records.map((r) => r.id)).size === input.records.length,
-    'Duplicate export records.',
-  );
+type ExportRecord = Prisma.TimeSegmentGetPayload<{ include: typeof segmentInclude }>;
+// Exporting hundreds of records in one serializable transaction exceeds the 20s
+// statement timeout. Validate in small chunks, then create the batch in a final
+// lightweight transaction that re-verifies nothing changed in between.
+const EXPORT_CHUNK = 25;
+async function validateExportChunk(
+  actor: Actor,
+  chunk: { id: string; version: number }[],
+  overrideReason: string | undefined,
+  weekStart: Date,
+): Promise<ExportRecord[]> {
   return transaction(async (tx) => {
     const records = await tx.timeSegment.findMany({
-      where: { id: { in: input.records.map((r) => r.id) } },
+      where: { id: { in: chunk.map((r) => r.id) } },
       include: segmentInclude,
       orderBy: [{ user: { lastName: 'asc' } }, { effectiveStart: 'asc' }],
     });
-    ensure(records.length === input.records.length, 'Some records no longer exist.');
+    ensure(records.length === chunk.length, 'Some records no longer exist.');
     await lockUsers(
       tx,
       records.map((r) => r.userId),
     );
-    const settings = await companySettings(tx);
-    const weekStart = previousWeek(new Date(), settings.timezone).end;
     for (const record of records) {
       ensure(
-        record.version === input.records.find((r) => r.id === record.id)?.version,
+        record.version === chunk.find((r) => r.id === record.id)?.version,
         'A record changed. Refresh before exporting.',
         409,
       );
@@ -103,7 +107,7 @@ export async function finalizeExport(actor: Actor, input: z.infer<typeof exportS
       );
       ensure(
         record.status === 'PM_APPROVED' ||
-          (has(actor, 'OWNER') && (input.overrideReason?.trim().length ?? 0) >= 10),
+          (has(actor, 'OWNER') && (overrideReason?.trim().length ?? 0) >= 10),
         'Only PM-approved records can be exported.',
       );
       ensure(
@@ -111,6 +115,45 @@ export async function finalizeExport(actor: Actor, input: z.infer<typeof exportS
         'Export completed working days from completed weeks.',
       );
       await validateClosed(tx, record);
+    }
+    return records;
+  });
+}
+export async function finalizeExport(actor: Actor, input: z.infer<typeof exportSchema>) {
+  await requireManagement(actor, 'send');
+  ensure(
+    new Set(input.records.map((r) => r.id)).size === input.records.length,
+    'Duplicate export records.',
+  );
+  const settings = await companySettings();
+  const weekStart = previousWeek(await databaseNow(db), settings.timezone).end;
+  const validated: ExportRecord[] = [];
+  for (let i = 0; i < input.records.length; i += EXPORT_CHUNK)
+    validated.push(
+      ...(await validateExportChunk(
+        actor,
+        input.records.slice(i, i + EXPORT_CHUNK),
+        input.overrideReason,
+        weekStart,
+      )),
+    );
+  validated.sort(
+    (a, b) =>
+      a.user.lastName.localeCompare(b.user.lastName) || +a.effectiveStart - +b.effectiveStart,
+  );
+  return transaction(async (tx) => {
+    const fresh = await tx.timeSegment.findMany({
+      where: { id: { in: validated.map((r) => r.id) } },
+      select: { id: true, version: true, status: true },
+    });
+    ensure(fresh.length === validated.length, 'Some records no longer exist.');
+    for (const f of fresh) {
+      const original = validated.find((r) => r.id === f.id)!;
+      ensure(
+        f.version === original.version && f.status === original.status,
+        'A record changed. Refresh before exporting.',
+        409,
+      );
     }
     const rows: unknown[][] = [
       [
@@ -135,19 +178,22 @@ export async function finalizeExport(actor: Actor, input: z.infer<typeof exportS
         'Owner override reason',
       ],
     ];
-    for (const r of records) {
+    for (const r of validated) {
       const duration = durationMs(r.effectiveStart, r.end!);
       const approval = r.approvals.find((a) => a.segmentVersion === r.version);
+      // Render dates in the workday's stored timezone so each row shows the
+      // payroll day the hours were recorded against.
+      const rowZone = r.workDay.timezone;
       rows.push([
         `${r.user.firstName} ${r.user.lastName}`,
         r.userId,
-        DateTime.fromJSDate(r.effectiveStart, { zone: settings.timezone }).toISODate(),
+        DateTime.fromJSDate(r.effectiveStart, { zone: rowZone }).toISODate(),
         r.jobsite.name,
         r.jobsite.number,
         r.task?.name,
         r.type,
-        DateTime.fromJSDate(r.effectiveStart, { zone: settings.timezone }).toISO(),
-        DateTime.fromJSDate(r.end!, { zone: settings.timezone }).toISO(),
+        DateTime.fromJSDate(r.effectiveStart, { zone: rowZone }).toISO(),
+        DateTime.fromJSDate(r.end!, { zone: rowZone }).toISO(),
         r.type === 'TRAVEL' ? '0.0000' : hours(duration),
         r.type === 'TRAVEL' ? hours(duration) : '0.0000',
         hours(duration),
@@ -165,11 +211,11 @@ export async function finalizeExport(actor: Actor, input: z.infer<typeof exportS
         actorId: actor.id,
         csv: csv(rows),
         reason: input.overrideReason,
-        items: { create: records.map((r) => ({ segmentId: r.id })) },
+        items: { create: validated.map((r) => ({ segmentId: r.id })) },
       },
     });
     await tx.timeSegment.updateMany({
-      where: { id: { in: records.map((r) => r.id) } },
+      where: { id: { in: validated.map((r) => r.id) } },
       data: { status: 'EXPORTED' },
     });
     await audit(
@@ -178,11 +224,11 @@ export async function finalizeExport(actor: Actor, input: z.infer<typeof exportS
       'ACCOUNTING_EXPORT',
       'ExportBatch',
       batch.id,
-      records.map((r) => ({ id: r.id, status: r.status, version: r.version })),
-      { recordIds: records.map((r) => r.id) },
+      validated.map((r) => ({ id: r.id, status: r.status, version: r.version })),
+      { recordIds: validated.map((r) => r.id) },
       input.overrideReason,
     );
-    return { id: batch.id, count: records.length };
+    return { id: batch.id, count: validated.length };
   });
 }
 export async function emailExport(actor: Actor, batchId: string) {

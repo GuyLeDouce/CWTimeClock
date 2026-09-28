@@ -17,10 +17,10 @@ ENV HOSTNAME=0.0.0.0
 COPY --from=build --chown=node:node /app/.next/standalone ./
 COPY --from=build --chown=node:node /app/.next/static ./.next/static
 COPY --from=build --chown=node:node /app/public ./public
-# Keep Prisma CLI, tsx and seed dependencies available to Railway's pre-deploy/setup commands.
+# Keep Prisma CLI, tsx and seed/retention dependencies available to Railway's pre-deploy/setup commands and cron jobs.
 COPY --from=build --chown=node:node /app/node_modules ./node_modules
 COPY --from=build --chown=node:node /app/prisma ./prisma
-COPY --from=build --chown=node:node /app/src/lib/crypto.ts /app/src/lib/time.ts /app/src/lib/errors.ts ./src/lib/
+COPY --from=build --chown=node:node /app/src/lib/crypto.ts /app/src/lib/time.ts /app/src/lib/errors.ts /app/src/lib/db.ts /app/src/lib/retention.ts ./src/lib/
 COPY --from=build --chown=node:node /app/package.json ./package.json
 USER node
 EXPOSE 3000

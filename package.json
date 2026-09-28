@@ -11,17 +11,18 @@
     "start": "next start --hostname 0.0.0.0",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
-    "test": "vitest run tests/unit.test.ts tests/email.test.ts",
+    "test": "vitest run tests/unit.test.ts tests/email.test.ts tests/offline.test.ts",
     "test:integration": "vitest run tests/integration.test.ts",
     "test:e2e": "playwright test",
     "db:generate": "prisma generate",
     "db:migrate": "prisma migrate deploy",
     "db:dev": "prisma migrate dev",
-    "db:seed": "tsx prisma/seed.ts",
-    "db:owner-reset": "tsx prisma/reset-owner.ts",
+    "db:seed": "NODE_OPTIONS='--conditions=react-server' tsx prisma/seed.ts",
+    "db:owner-reset": "NODE_OPTIONS='--conditions=react-server' tsx prisma/reset-owner.ts",
     "db:studio": "prisma studio",
     "postinstall": "prisma generate",
-    "format": "prettier --write ."
+    "format": "prettier --write .",
+    "retention": "NODE_OPTIONS='--conditions=react-server' tsx scripts/retention.ts"
   },
   "prisma": {
     "seed": "tsx prisma/seed.ts"

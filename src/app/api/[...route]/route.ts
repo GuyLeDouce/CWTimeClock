@@ -30,14 +30,41 @@ import { adminData, adminSchema, saveAdmin, manageQr, qrSchema } from '@/lib/adm
 import { importCsv, importSchema, template, templates } from '@/lib/imports';
 import { visit, visitSchema, visits } from '@/lib/visits';
 import { digest } from '@/lib/crypto';
+import { emailSchema } from '@/lib/validation';
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
+// Best-effort client IP for rate limiting. Railway's edge proxy sets
+// x-forwarded-for to the real client address; the first entry is standard.
+function clientIp(request: NextRequest) {
+  const forwarded = request.headers.get('x-forwarded-for');
+  const raw =
+    forwarded?.split(',')[0]?.trim() || request.headers.get('x-real-ip')?.trim() || 'unknown';
+  return raw.slice(0, 64).replace(/[^0-9a-fA-F.:]/g, '') || 'unknown';
+}
+// Authenticated GETs that can return thousands of rows or generate files.
+const HEAVY_GETS = new Set([
+  'records',
+  'info',
+  'admin',
+  'exports',
+  'export/download',
+  'admin/qr-image',
+]);
 const credentials = z
   .object({
-    email: z.email().transform((v) => v.toLowerCase().trim()),
+    email: emailSchema,
     password: z.string().min(1).max(256),
   })
   .strict();
+// Compare origins structurally so a trailing slash, default port or host casing
+// from a trusted proxy does not turn a legitimate same-origin request into a 403.
+function normalizeOrigin(value: string | null) {
+  try {
+    return new URL((value ?? '').trim()).origin.toLowerCase();
+  } catch {
+    return '';
+  }
+}
 async function dispatch(request: NextRequest, path: string, body: unknown) {
   const get = request.method === 'GET';
   const params = Object.fromEntries(request.nextUrl.searchParams);
@@ -47,11 +74,15 @@ async function dispatch(request: NextRequest, path: string, body: unknown) {
   }
   if (!get && path === 'auth/login') {
     const input = credentials.parse(body);
+    // Email-keyed limiting (inside login) stops targeted guessing; IP-keyed
+    // limiting stops credential stuffing across many accounts.
+    await rateLimit(`login-ip:${clientIp(request)}`, 30, 900);
     return login(input.email, input.password);
   }
   if (!get && path === 'auth/forgot') {
+    await rateLimit(`forgot-ip:${clientIp(request)}`, 10, 3600);
     return sendReset(
-      z.object({ email: z.email().transform((v) => v.toLowerCase().trim()) }).parse(body).email,
+      z.object({ email: emailSchema }).parse(body).email,
     );
   }
   if (!get && path === 'auth/reset') {
@@ -63,6 +94,7 @@ async function dispatch(request: NextRequest, path: string, body: unknown) {
   }
   const actor = await requireUser();
   if (!get) await rateLimit(`action:${actor.id}`, 150, 60);
+  if (get && HEAVY_GETS.has(path)) await rateLimit(`heavy:${actor.id}`, 60, 60);
   if (get && path === 'state') return state(actor, params.qr);
   if (get && path === 'hours') return myHours(actor);
   if (get && path === 'locate') return locate(actor);
@@ -147,13 +179,30 @@ async function dispatch(request: NextRequest, path: string, body: unknown) {
     );
     checkEmailConfiguration();
     const token = await issueToken(id, 'RESET_PASSWORD');
-    await db.session.deleteMany({ where: { userId: id } });
+    // Send first: if delivery fails, the employee keeps their sessions and no
+    // undeliverable token is left active. Only then revoke sessions and retire
+    // any older unused reset tokens for this account.
     await sendEmail({
       to: target.email,
       subject: 'Set your Cedar Winds password',
       text: `Your administrator has requested a password reset. Set your password within 30 minutes:\n${appUrl()}/reset-password?token=${token}`,
     });
-    await audit(db, actor.id, 'ADMIN_PASSWORD_RESET', 'User', id, null, { sessionsRevoked: true });
+    await transaction(async (tx) => {
+      const now = await databaseNow(tx);
+      await tx.actionToken.updateMany({
+        where: {
+          userId: id,
+          purpose: 'RESET_PASSWORD',
+          usedAt: null,
+          tokenHash: { not: digest(token) },
+        },
+        data: { usedAt: now },
+      });
+      await tx.session.deleteMany({ where: { userId: id } });
+      await audit(tx, actor.id, 'ADMIN_PASSWORD_RESET', 'User', id, null, {
+        sessionsRevoked: true,
+      });
+    });
     return { ok: true, message: 'Password email sent; existing sessions revoked.' };
   }
   if (!get && path === 'desktop/email') {
@@ -195,7 +244,11 @@ async function handler(request: NextRequest, context: { params: Promise<{ route:
     let body: unknown;
     if (request.method !== 'GET') {
       stage = 'origin-check';
-      ensure(request.headers.get('origin') === appUrl(), 'Request origin is not allowed.', 403);
+      ensure(
+        normalizeOrigin(request.headers.get('origin')) === normalizeOrigin(appUrl()),
+        'Request origin is not allowed.',
+        403,
+      );
       stage = 'request-body';
       ensure(
         request.headers.get('content-type')?.includes('application/json'),
@@ -233,6 +286,15 @@ async function handler(request: NextRequest, context: { params: Promise<{ route:
     } else if (
       error instanceof Prisma.PrismaClientKnownRequestError &&
       ['P2002', 'P2003', 'P2004', 'P2010', 'P2034'].includes(error.code)
+    ) {
+      status = 409;
+      message =
+        'This change conflicts with an existing record. Refresh and check for duplicates or overlapping time.';
+    } else if (
+      // PostgreSQL exclusion-constraint violations (overlapping time segments)
+      // surface as unknown engine errors, not P2002. Map them to 409 as well.
+      error instanceof Prisma.PrismaClientUnknownRequestError &&
+      /exclusion|23P01/i.test(error.message)
     ) {
       status = 409;
       message =

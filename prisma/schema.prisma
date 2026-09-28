@@ -227,6 +227,8 @@ model Session {
   user User @relation(fields:[userId],references:[id],onDelete:Cascade)
   expiresAt DateTime @db.Timestamptz(3)
   createdAt DateTime @default(now()) @db.Timestamptz(3)
+
+  @@index([userId])
 }
 model ActionToken {
   id String @id @default(cuid())
@@ -236,6 +238,8 @@ model ActionToken {
   purpose TokenPurpose
   expiresAt DateTime @db.Timestamptz(3)
   usedAt DateTime? @db.Timestamptz(3)
+
+  @@index([userId])
 }
 model RateLimit {
   key String @id
@@ -284,5 +288,4 @@ model Settings {
   id String @id @default("company")
   timezone String @default("America/Toronto")
   reportRecipient String @default("")
-  weekStartsOn Int @default(1)
 }
